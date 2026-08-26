@@ -185,6 +185,10 @@ class sharded_array_memory_resource {
     return state_->statistics;
   }
 
+  /// Locality-domain place group backing this resource's allocations; exposes
+  /// the per-domain green-context streams for confined-execution experiments.
+  [[nodiscard]] cuda::experimental::places::place_group& group() const { return state_->group; }
+
   [[nodiscard]] bool contiguous_backing_supported() const
   {
     return cuda::experimental::sharded::contiguous_backing_supported(0);

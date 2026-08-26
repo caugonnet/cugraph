@@ -20,6 +20,8 @@
 #include <cuda/memory_resource>
 
 #include <gtest/gtest.h>
+#include <thrust/binary_search.h>
+#include <thrust/fill.h>
 #include <thrust/reduce.h>
 #include <thrust/sequence.h>
 
@@ -231,6 +233,114 @@ measurement run_sampling(backing_kind backing,
     allocation};
 }
 
+// Warp-per-row SpMV-shaped pass over the retained CSC: the access shape of
+// per_v_transform_reduce_incoming_e, hub-safe on power-law RMAT rows.
+__global__ void raw_spmv_warp_per_row(edge_t const* __restrict__ offsets,
+                                      vertex_t const* __restrict__ indices,
+                                      float const* __restrict__ ranks,
+                                      float* __restrict__ out,
+                                      vertex_t row_first,
+                                      vertex_t row_last)
+{
+  auto const warp   = (blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x) / 32;
+  int const lane    = threadIdx.x % 32;
+  auto const nwarps = static_cast<size_t>(gridDim.x) * blockDim.x / 32;
+  for (size_t r = row_first + warp; r < static_cast<size_t>(row_last); r += nwarps) {
+    float acc = 0.f;
+    for (edge_t e = offsets[r] + lane; e < offsets[r + 1]; e += 32) {
+      acc += ranks[indices[e]];
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+      acc += __shfl_down_sync(0xffffffff, acc, o);
+    }
+    if (lane == 0) { out[r] = acc; }
+  }
+}
+
+// Confined-execution measurement over the REAL retained graph storage,
+// consuming cuGraph's unmodified graph object through its edge-partition
+// view. The confinement boundary is the row owning byte E/2 of the indices
+// array (blocked placement splits the dominant array there, NOT at V/2 —
+// RMAT hubs concentrate edges in low vertex IDs).
+void run_raw_spmv(raft::handle_t const& handle,
+                  cugraph::graph_view_t<vertex_t, edge_t, true, false> const& graph_view,
+                  sharded_array_memory_resource& resource,
+                  backing_kind backing,
+                  std::size_t iterations)
+{
+  auto const epv      = graph_view.local_edge_partition_view();
+  auto const* offsets = epv.offsets().data();
+  auto const* indices = epv.indices().data();
+  auto const v_count  = graph_view.number_of_vertices();
+  auto const e_count  = static_cast<edge_t>(epv.indices().size());
+
+  rmm::device_uvector<float> ranks(v_count, handle.get_stream());
+  rmm::device_uvector<float> out(v_count, handle.get_stream());
+  thrust::fill(rmm::exec_policy(handle.get_stream()), ranks.begin(), ranks.end(),
+               1.0f / static_cast<float>(v_count));
+
+  auto const boundary_it = thrust::lower_bound(rmm::exec_policy(handle.get_stream()),
+                                               epv.offsets().data(),
+                                               epv.offsets().data() + v_count + 1,
+                                               e_count / 2);
+  auto const boundary = static_cast<vertex_t>(boundary_it - epv.offsets().data());
+  handle.sync_stream();
+
+  auto time_streams = [&](std::vector<cudaStream_t> const& streams, auto&& launch) {
+    auto sync_all = [&] {
+      for (auto s : streams) {
+        RAFT_CUDA_TRY(cudaStreamSynchronize(s));
+      }
+    };
+    launch();
+    sync_all();
+    std::vector<double> ms;
+    ms.reserve(iterations);
+    for (std::size_t i = 0; i < iterations; ++i) {
+      sync_all();
+      auto const t0 = std::chrono::steady_clock::now();
+      launch();
+      sync_all();
+      auto const t1 = std::chrono::steady_clock::now();
+      ms.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+    }
+    std::sort(ms.begin(), ms.end());
+    return std::pair{ms[ms.size() / 2], ms.front()};
+  };
+
+  auto print = [&](char const* arm, std::pair<double, double> t) {
+    std::cout << std::fixed << std::setprecision(3) << "VMM_LOCALITY_RAW_SPMV"
+              << " backing=" << (backing == backing_kind::sharded ? "cccl_sharded_array" : "rmm_pool")
+              << " arm=" << arm << " boundary_row=" << boundary
+              << " median_ms=" << t.first << " min_ms=" << t.second << '\n';
+  };
+
+  constexpr int blocks = 4096, threads = 256;
+  cudaStream_t const wide = handle.get_stream();
+  print("wide", time_streams({wide}, [&] {
+          raw_spmv_warp_per_row<<<blocks, threads, 0, wide>>>(offsets, indices, ranks.data(),
+                                                              out.data(), 0, v_count);
+        }));
+
+  if (backing == backing_kind::sharded) {
+    auto& group       = resource.group();
+    cudaStream_t dom0 = group.get_stream(0);
+    cudaStream_t dom1 = group.get_stream(1);
+    print("conf", time_streams({dom0, dom1}, [&] {
+            raw_spmv_warp_per_row<<<blocks, threads, 0, dom0>>>(offsets, indices, ranks.data(),
+                                                                out.data(), 0, boundary);
+            raw_spmv_warp_per_row<<<blocks, threads, 0, dom1>>>(offsets, indices, ranks.data(),
+                                                                out.data(), boundary, v_count);
+          }));
+    print("mis", time_streams({dom0, dom1}, [&] {
+            raw_spmv_warp_per_row<<<blocks, threads, 0, dom0>>>(offsets, indices, ranks.data(),
+                                                                out.data(), boundary, v_count);
+            raw_spmv_warp_per_row<<<blocks, threads, 0, dom1>>>(offsets, indices, ranks.data(),
+                                                                out.data(), 0, boundary);
+          }));
+  }
+}
+
 measurement run_pagerank(backing_kind backing,
                          cugraph::test::Rmat_Usecase const& usecase,
                          std::size_t iterations)
@@ -279,6 +389,8 @@ measurement run_pagerank(backing_kind backing,
   handle.sync_stream();
   auto const allocation =
     backing == backing_kind::sharded ? resource.statistics() : sharded_resource_statistics{};
+
+  run_raw_spmv(handle, graph_view, resource, backing, iterations);
 
   EXPECT_NEAR(rank_sum, 1.0, 1e-4);
   if (backing == backing_kind::sharded) {
