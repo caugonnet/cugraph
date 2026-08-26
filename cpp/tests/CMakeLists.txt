@@ -506,6 +506,18 @@ ConfigureTest(
     HOMOGENEOUS_UNIFORM_NEIGHBOR_SAMPLING_TEST sampling/homogeneous_uniform_neighbor_sampling.cpp
         GPUS 1 PERCENT 75)
 
+if(BUILD_CUGRAPH_VMM_LOCALITY_EXPERIMENT)
+    ConfigureTest(
+        VMM_LOCALITY_EXPERIMENT experimental/vmm_locality/vmm_locality_experiment.cu
+        GPUS 1 PERCENT 100)
+    target_link_libraries(
+        VMM_LOCALITY_EXPERIMENT
+        PRIVATE
+            CCCL::cudax
+            CUDA::cuda_driver)
+    set_tests_properties(VMM_LOCALITY_EXPERIMENT PROPERTIES LABELS "CUGRAPH;EXPERIMENTAL")
+endif()
+
 # - HETEROGENEOUS UNIFORM NBR SAMPLING tests -----------------------------------------------------
 ConfigureTest(
     HETEROGENEOUS_UNIFORM_NEIGHBOR_SAMPLING_TEST sampling/heterogeneous_uniform_neighbor_sampling.cpp
