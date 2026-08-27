@@ -2500,7 +2500,8 @@ rmm::device_uvector<edge_t> compute_aggregate_local_frontier_per_type_local_degr
 
 // return (bias values, local neighbor indices with non-zero bias values, segment offsets) pairs for
 // each key in th eaggregate local frontier
-template <typename GraphViewType,
+template <typename SegmentLauncher,
+          typename GraphViewType,
           typename KeyIterator,
           typename EdgeSrcValueInputWrapper,
           typename EdgeDstValueInputWrapper,
@@ -2515,15 +2516,17 @@ std::tuple<rmm::device_uvector<
                                           BiasEdgeOp>::type>,
            rmm::device_uvector<typename GraphViewType::edge_type>,
            rmm::device_uvector<size_t>>
-compute_aggregate_local_frontier_biases(raft::handle_t const& handle,
-                                        GraphViewType const& graph_view,
-                                        KeyIterator aggregate_local_frontier_key_first,
-                                        EdgeSrcValueInputWrapper edge_src_value_input,
-                                        EdgeDstValueInputWrapper edge_dst_value_input,
-                                        EdgeValueInputWrapper edge_value_input,
-                                        BiasEdgeOp bias_e_op,
-                                        raft::host_span<size_t const> local_frontier_offsets,
-                                        bool do_expensive_check)
+compute_aggregate_local_frontier_biases_with_segment_launcher(
+  raft::handle_t const& handle,
+  GraphViewType const& graph_view,
+  KeyIterator aggregate_local_frontier_key_first,
+  EdgeSrcValueInputWrapper edge_src_value_input,
+  EdgeDstValueInputWrapper edge_dst_value_input,
+  EdgeValueInputWrapper edge_value_input,
+  BiasEdgeOp bias_e_op,
+  raft::host_span<size_t const> local_frontier_offsets,
+  bool do_expensive_check,
+  SegmentLauncher& segment_launcher)
 {
   using vertex_t = typename GraphViewType::vertex_type;
   using edge_t   = typename GraphViewType::edge_type;
@@ -2542,7 +2545,7 @@ compute_aggregate_local_frontier_biases(raft::handle_t const& handle,
   std::adjacent_difference(
     local_frontier_offsets.begin() + 1, local_frontier_offsets.end(), local_frontier_sizes.begin());
   auto [aggregate_local_frontier_biases, aggregate_local_frontier_local_degree_offsets] =
-    transform_v_frontier_e(
+    transform_v_frontier_e_with_segment_launcher(
       handle,
       graph_view,
       aggregate_local_frontier_key_first,
@@ -2550,7 +2553,8 @@ compute_aggregate_local_frontier_biases(raft::handle_t const& handle,
       edge_dst_value_input,
       edge_value_input,
       bias_e_op,
-      raft::host_span<size_t const>(local_frontier_offsets.data(), local_frontier_offsets.size()));
+      raft::host_span<size_t const>(local_frontier_offsets.data(), local_frontier_offsets.size()),
+      segment_launcher);
 
   // 2. expensive check
 
@@ -2642,6 +2646,36 @@ compute_aggregate_local_frontier_biases(raft::handle_t const& handle,
   return std::make_tuple(std::move(aggregate_local_frontier_biases),
                          std::move(aggregate_local_frontier_nz_bias_indices),
                          std::move(aggregate_local_frontier_local_degree_offsets));
+}
+
+template <typename GraphViewType,
+          typename KeyIterator,
+          typename EdgeSrcValueInputWrapper,
+          typename EdgeDstValueInputWrapper,
+          typename EdgeValueInputWrapper,
+          typename BiasEdgeOp>
+auto compute_aggregate_local_frontier_biases(raft::handle_t const& handle,
+                                             GraphViewType const& graph_view,
+                                             KeyIterator aggregate_local_frontier_key_first,
+                                             EdgeSrcValueInputWrapper edge_src_value_input,
+                                             EdgeDstValueInputWrapper edge_dst_value_input,
+                                             EdgeValueInputWrapper edge_value_input,
+                                             BiasEdgeOp bias_e_op,
+                                             raft::host_span<size_t const> local_frontier_offsets,
+                                             bool do_expensive_check)
+{
+  direct_transform_v_frontier_e_segment_launcher segment_launcher{handle.get_stream()};
+  return compute_aggregate_local_frontier_biases_with_segment_launcher(
+    handle,
+    graph_view,
+    aggregate_local_frontier_key_first,
+    edge_src_value_input,
+    edge_dst_value_input,
+    edge_value_input,
+    bias_e_op,
+    local_frontier_offsets,
+    do_expensive_check,
+    segment_launcher);
 }
 
 // return (bias values, edge types, local neighbor indices with non-zero bias values, segment
@@ -5494,7 +5528,8 @@ heterogeneous_uniform_sample_and_compute_local_nbr_indices(
     std::move(local_nbr_indices), std::move(key_indices), std::move(local_frontier_sample_offsets));
 }
 
-template <typename GraphViewType,
+template <typename SegmentLauncher,
+          typename GraphViewType,
           typename KeyIterator,
           typename EdgeSrcValueInputWrapper,
           typename EdgeDstValueInputWrapper,
@@ -5503,7 +5538,7 @@ template <typename GraphViewType,
 std::tuple<rmm::device_uvector<typename GraphViewType::edge_type>,
            std::optional<rmm::device_uvector<size_t>>,
            std::vector<size_t>>
-homogeneous_biased_sample_and_compute_local_nbr_indices(
+homogeneous_biased_sample_and_compute_local_nbr_indices_with_segment_launcher(
   raft::handle_t const& handle,
   GraphViewType const& graph_view,
   KeyIterator aggregate_local_frontier_key_first,
@@ -5515,7 +5550,8 @@ homogeneous_biased_sample_and_compute_local_nbr_indices(
   raft::random::RngState* rng_state /* top-k select if nullptr, random select otherwise */,
   size_t K,
   bool with_replacement,
-  bool do_expensive_check /* check bias_e_op return values */)
+  bool do_expensive_check /* check bias_e_op return values */,
+  SegmentLauncher& segment_launcher)
 {
   using vertex_t = typename GraphViewType::vertex_type;
   using edge_t   = typename GraphViewType::edge_type;
@@ -5558,7 +5594,7 @@ homogeneous_biased_sample_and_compute_local_nbr_indices(
   auto [aggregate_local_frontier_unique_key_biases,
         aggregate_local_frontier_unique_key_nz_bias_indices,
         aggregate_local_frontier_unique_key_local_degree_offsets] =
-    compute_aggregate_local_frontier_biases(
+    compute_aggregate_local_frontier_biases_with_segment_launcher(
       handle,
       graph_view,
       get_dataframe_buffer_begin(aggregate_local_frontier_unique_keys),
@@ -5568,7 +5604,8 @@ homogeneous_biased_sample_and_compute_local_nbr_indices(
       bias_e_op,
       raft::host_span<size_t const>(local_frontier_unique_key_offsets.data(),
                                     local_frontier_unique_key_offsets.size()),
-      do_expensive_check);
+      do_expensive_check,
+      segment_launcher);
 
   // 2. sample neighbor indices and shuffle neighbor indices
 
@@ -5652,6 +5689,43 @@ homogeneous_biased_sample_and_compute_local_nbr_indices(
 
   return std::make_tuple(
     std::move(local_nbr_indices), std::move(key_indices), std::move(local_frontier_sample_offsets));
+}
+
+template <typename GraphViewType,
+          typename KeyIterator,
+          typename EdgeSrcValueInputWrapper,
+          typename EdgeDstValueInputWrapper,
+          typename EdgeValueInputWrapper,
+          typename BiasEdgeOp>
+auto homogeneous_biased_sample_and_compute_local_nbr_indices(
+  raft::handle_t const& handle,
+  GraphViewType const& graph_view,
+  KeyIterator aggregate_local_frontier_key_first,
+  EdgeSrcValueInputWrapper edge_src_value_input,
+  EdgeDstValueInputWrapper edge_dst_value_input,
+  EdgeValueInputWrapper edge_value_input,
+  BiasEdgeOp bias_e_op,
+  raft::host_span<size_t const> local_frontier_offsets,
+  raft::random::RngState* rng_state,
+  size_t K,
+  bool with_replacement,
+  bool do_expensive_check)
+{
+  direct_transform_v_frontier_e_segment_launcher segment_launcher{handle.get_stream()};
+  return homogeneous_biased_sample_and_compute_local_nbr_indices_with_segment_launcher(
+    handle,
+    graph_view,
+    aggregate_local_frontier_key_first,
+    edge_src_value_input,
+    edge_dst_value_input,
+    edge_value_input,
+    bias_e_op,
+    local_frontier_offsets,
+    rng_state,
+    K,
+    with_replacement,
+    do_expensive_check,
+    segment_launcher);
 }
 
 template <typename GraphViewType,

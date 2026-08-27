@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2020-2026, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2020-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 #pragma once
@@ -165,15 +165,20 @@ std::tuple<size_t, size_t> compute_new_near_near_partition_range(
 
 namespace detail {
 
-template <typename GraphViewType, typename weight_t, typename PredecessorIterator>
-void sssp(raft::handle_t const& handle,
-          GraphViewType const& graph_view,
-          edge_property_view_t<typename GraphViewType::edge_type, weight_t const*> edge_weight_view,
-          weight_t* distances,
-          PredecessorIterator predecessor_first,
-          typename GraphViewType::vertex_type source_vertex,
-          weight_t cutoff,
-          bool do_expensive_check)
+template <typename GraphViewType,
+          typename weight_t,
+          typename PredecessorIterator,
+          typename SegmentLauncher>
+void sssp_with_segment_launcher(
+  raft::handle_t const& handle,
+  GraphViewType const& graph_view,
+  edge_property_view_t<typename GraphViewType::edge_type, weight_t const*> edge_weight_view,
+  weight_t* distances,
+  PredecessorIterator predecessor_first,
+  typename GraphViewType::vertex_type source_vertex,
+  weight_t cutoff,
+  bool do_expensive_check,
+  SegmentLauncher& segment_launcher)
 {
   using vertex_t = typename GraphViewType::vertex_type;
 
@@ -233,15 +238,16 @@ void sssp(raft::handle_t const& handle,
   weight_t average_vertex_degree =
     static_cast<weight_t>(num_edges) / static_cast<weight_t>(num_vertices);
   weight_t average_edge_weight{0.0};
-  average_edge_weight =
-    transform_reduce_e(handle,
-                       graph_view,
-                       edge_src_dummy_property_t{}.view(),
-                       edge_dst_dummy_property_t{}.view(),
-                       edge_weight_view,
-                       cuda::proclaim_return_type<weight_t>(
-                         [] __device__(vertex_t, vertex_t, auto, auto, weight_t w) { return w; }),
-                       weight_t{0.0});
+  average_edge_weight = transform_reduce_e_with_segment_launcher(
+    handle,
+    graph_view,
+    edge_src_dummy_property_t{}.view(),
+    edge_dst_dummy_property_t{}.view(),
+    edge_weight_view,
+    cuda::proclaim_return_type<weight_t>(
+      [] __device__(vertex_t, vertex_t, auto, auto, weight_t w) { return w; }),
+    weight_t{0.0},
+    segment_launcher);
   average_edge_weight /= static_cast<weight_t>(num_edges);
   auto delta =
     (static_cast<weight_t>(raft::warp_size()) * average_edge_weight) / average_vertex_degree;
@@ -563,6 +569,28 @@ void sssp(raft::handle_t const& handle,
 
     if (empty_queue) { break; }
   }
+}
+
+template <typename GraphViewType, typename weight_t, typename PredecessorIterator>
+void sssp(raft::handle_t const& handle,
+          GraphViewType const& graph_view,
+          edge_property_view_t<typename GraphViewType::edge_type, weight_t const*> edge_weight_view,
+          weight_t* distances,
+          PredecessorIterator predecessor_first,
+          typename GraphViewType::vertex_type source_vertex,
+          weight_t cutoff,
+          bool do_expensive_check)
+{
+  direct_transform_reduce_e_segment_launcher segment_launcher{handle.get_stream()};
+  sssp_with_segment_launcher(handle,
+                             graph_view,
+                             edge_weight_view,
+                             distances,
+                             predecessor_first,
+                             source_vertex,
+                             cutoff,
+                             do_expensive_check,
+                             segment_launcher);
 }
 
 }  // namespace detail

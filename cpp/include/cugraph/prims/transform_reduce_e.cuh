@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2020-2026, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2020-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 #pragma once
@@ -22,6 +22,7 @@
 #include <raft/core/handle.hpp>
 #include <raft/util/cudart_utils.hpp>
 
+#include <rmm/cuda_stream_view.hpp>
 #include <rmm/exec_policy.hpp>
 
 #include <cuda/std/functional>
@@ -377,6 +378,25 @@ __global__ static void transform_reduce_e_high_degree(
   if (threadIdx.x == 0) { atomic_add(result_iter, e_op_result_sum); }
 }
 
+class direct_transform_reduce_e_segment_launcher {
+ public:
+  explicit direct_transform_reduce_e_segment_launcher(rmm::cuda_stream_view stream)
+    : stream_(stream.value())
+  {
+  }
+
+  template <typename Launch>
+  void submit(char const*, Launch&& launch)
+  {
+    launch(stream_);
+  }
+
+  void join() const {}
+
+ private:
+  cudaStream_t stream_{};
+};
+
 }  // namespace detail
 
 /**
@@ -413,20 +433,24 @@ __global__ static void transform_reduce_e_high_degree(
  * @param do_expensive_check A flag to run expensive checks for input arguments (if set to `true`).
  * @return T Transform-reduced @p edge_op outputs.
  */
-template <typename GraphViewType,
+namespace detail {
+
+template <typename SegmentLauncher,
+          typename GraphViewType,
           typename EdgeSrcValueInputWrapper,
           typename EdgeDstValueInputWrapper,
           typename EdgeValueInputWrapper,
           typename EdgeOp,
           typename T>
-T transform_reduce_e(raft::handle_t const& handle,
-                     GraphViewType const& graph_view,
-                     EdgeSrcValueInputWrapper edge_src_value_input,
-                     EdgeDstValueInputWrapper edge_dst_value_input,
-                     EdgeValueInputWrapper edge_value_input,
-                     EdgeOp e_op,
-                     T init,
-                     bool do_expensive_check = false)
+T transform_reduce_e_with_segment_launcher(raft::handle_t const& handle,
+                                           GraphViewType const& graph_view,
+                                           EdgeSrcValueInputWrapper edge_src_value_input,
+                                           EdgeDstValueInputWrapper edge_dst_value_input,
+                                           EdgeValueInputWrapper edge_value_input,
+                                           EdgeOp e_op,
+                                           T init,
+                                           SegmentLauncher& segment_launcher,
+                                           bool do_expensive_check = false)
 {
   static_assert(is_arithmetic_or_thrust_tuple_of_arithmetic<T>::value);
 
@@ -469,6 +493,7 @@ T transform_reduce_e(raft::handle_t const& handle,
                 get_dataframe_buffer_begin(result_buffer),
                 get_dataframe_buffer_begin(result_buffer) + 1,
                 T{});
+  auto result_buffer_first = get_dataframe_buffer_begin(result_buffer);
 
   auto edge_mask_view = graph_view.edge_mask_view();
 
@@ -506,63 +531,71 @@ T transform_reduce_e(raft::handle_t const& handle,
         raft::grid_1d_block_t update_grid((*segment_offsets)[1],
                                           detail::transform_reduce_e_kernel_block_size,
                                           handle.get_device_properties().maxGridSize[0]);
-        detail::transform_reduce_e_high_degree<GraphViewType>
-          <<<update_grid.num_blocks, update_grid.block_size, 0, handle.get_stream()>>>(
-            edge_partition,
-            edge_partition.major_range_first(),
-            edge_partition.major_range_first() + (*segment_offsets)[1],
-            edge_partition_src_value_input,
-            edge_partition_dst_value_input,
-            edge_partition_e_value_input,
-            edge_partition_e_mask,
-            get_dataframe_buffer_begin(result_buffer),
-            e_op);
+        segment_launcher.submit("transform_reduce_e/high", [=](cudaStream_t stream) {
+          detail::transform_reduce_e_high_degree<GraphViewType>
+            <<<update_grid.num_blocks, update_grid.block_size, 0, stream>>>(
+              edge_partition,
+              edge_partition.major_range_first(),
+              edge_partition.major_range_first() + (*segment_offsets)[1],
+              edge_partition_src_value_input,
+              edge_partition_dst_value_input,
+              edge_partition_e_value_input,
+              edge_partition_e_mask,
+              result_buffer_first,
+              e_op);
+        });
       }
       if ((*segment_offsets)[2] - (*segment_offsets)[1] > 0) {
         raft::grid_1d_warp_t update_grid((*segment_offsets)[2] - (*segment_offsets)[1],
                                          detail::transform_reduce_e_kernel_block_size,
                                          handle.get_device_properties().maxGridSize[0]);
-        detail::transform_reduce_e_mid_degree<GraphViewType>
-          <<<update_grid.num_blocks, update_grid.block_size, 0, handle.get_stream()>>>(
-            edge_partition,
-            edge_partition.major_range_first() + (*segment_offsets)[1],
-            edge_partition.major_range_first() + (*segment_offsets)[2],
-            edge_partition_src_value_input,
-            edge_partition_dst_value_input,
-            edge_partition_e_value_input,
-            edge_partition_e_mask,
-            get_dataframe_buffer_begin(result_buffer),
-            e_op);
+        segment_launcher.submit("transform_reduce_e/mid", [=](cudaStream_t stream) {
+          detail::transform_reduce_e_mid_degree<GraphViewType>
+            <<<update_grid.num_blocks, update_grid.block_size, 0, stream>>>(
+              edge_partition,
+              edge_partition.major_range_first() + (*segment_offsets)[1],
+              edge_partition.major_range_first() + (*segment_offsets)[2],
+              edge_partition_src_value_input,
+              edge_partition_dst_value_input,
+              edge_partition_e_value_input,
+              edge_partition_e_mask,
+              result_buffer_first,
+              e_op);
+        });
       }
       if ((*segment_offsets)[3] - (*segment_offsets)[2] > 0) {
         raft::grid_1d_thread_t update_grid((*segment_offsets)[3] - (*segment_offsets)[2],
                                            detail::transform_reduce_e_kernel_block_size,
                                            handle.get_device_properties().maxGridSize[0]);
-        detail::transform_reduce_e_low_degree<GraphViewType>
-          <<<update_grid.num_blocks, update_grid.block_size, 0, handle.get_stream()>>>(
-            edge_partition,
-            edge_partition.major_range_first() + (*segment_offsets)[2],
-            edge_partition.major_range_first() + (*segment_offsets)[3],
-            edge_partition_src_value_input,
-            edge_partition_dst_value_input,
-            edge_partition_e_value_input,
-            edge_partition_e_mask,
-            get_dataframe_buffer_begin(result_buffer),
-            e_op);
+        segment_launcher.submit("transform_reduce_e/low", [=](cudaStream_t stream) {
+          detail::transform_reduce_e_low_degree<GraphViewType>
+            <<<update_grid.num_blocks, update_grid.block_size, 0, stream>>>(
+              edge_partition,
+              edge_partition.major_range_first() + (*segment_offsets)[2],
+              edge_partition.major_range_first() + (*segment_offsets)[3],
+              edge_partition_src_value_input,
+              edge_partition_dst_value_input,
+              edge_partition_e_value_input,
+              edge_partition_e_mask,
+              result_buffer_first,
+              e_op);
+        });
       }
       if (edge_partition.dcs_nzd_vertex_count() && (*(edge_partition.dcs_nzd_vertex_count()) > 0)) {
         raft::grid_1d_thread_t update_grid(*(edge_partition.dcs_nzd_vertex_count()),
                                            detail::transform_reduce_e_kernel_block_size,
                                            handle.get_device_properties().maxGridSize[0]);
-        detail::transform_reduce_e_hypersparse<GraphViewType>
-          <<<update_grid.num_blocks, update_grid.block_size, 0, handle.get_stream()>>>(
-            edge_partition,
-            edge_partition_src_value_input,
-            edge_partition_dst_value_input,
-            edge_partition_e_value_input,
-            edge_partition_e_mask,
-            get_dataframe_buffer_begin(result_buffer),
-            e_op);
+        segment_launcher.submit("transform_reduce_e/hypersparse", [=](cudaStream_t stream) {
+          detail::transform_reduce_e_hypersparse<GraphViewType>
+            <<<update_grid.num_blocks, update_grid.block_size, 0, stream>>>(
+              edge_partition,
+              edge_partition_src_value_input,
+              edge_partition_dst_value_input,
+              edge_partition_e_value_input,
+              edge_partition_e_mask,
+              result_buffer_first,
+              e_op);
+        });
       }
     } else {
       if (edge_partition.major_range_size() > 0) {
@@ -570,20 +603,24 @@ T transform_reduce_e(raft::handle_t const& handle,
                                            detail::transform_reduce_e_kernel_block_size,
                                            handle.get_device_properties().maxGridSize[0]);
 
-        detail::transform_reduce_e_low_degree<GraphViewType>
-          <<<update_grid.num_blocks, update_grid.block_size, 0, handle.get_stream()>>>(
-            edge_partition,
-            edge_partition.major_range_first(),
-            edge_partition.major_range_last(),
-            edge_partition_src_value_input,
-            edge_partition_dst_value_input,
-            edge_partition_e_value_input,
-            edge_partition_e_mask,
-            get_dataframe_buffer_begin(result_buffer),
-            e_op);
+        segment_launcher.submit("transform_reduce_e/unsegmented", [=](cudaStream_t stream) {
+          detail::transform_reduce_e_low_degree<GraphViewType>
+            <<<update_grid.num_blocks, update_grid.block_size, 0, stream>>>(
+              edge_partition,
+              edge_partition.major_range_first(),
+              edge_partition.major_range_last(),
+              edge_partition_src_value_input,
+              edge_partition_dst_value_input,
+              edge_partition_e_value_input,
+              edge_partition_e_mask,
+              result_buffer_first,
+              e_op);
+        });
       }
     }
   }
+
+  segment_launcher.join();
 
   auto result = thrust::reduce(
     handle.get_thrust_policy(),
@@ -603,6 +640,35 @@ T transform_reduce_e(raft::handle_t const& handle,
   }
 
   return result;
+}
+
+}  // namespace detail
+
+template <typename GraphViewType,
+          typename EdgeSrcValueInputWrapper,
+          typename EdgeDstValueInputWrapper,
+          typename EdgeValueInputWrapper,
+          typename EdgeOp,
+          typename T>
+T transform_reduce_e(raft::handle_t const& handle,
+                     GraphViewType const& graph_view,
+                     EdgeSrcValueInputWrapper edge_src_value_input,
+                     EdgeDstValueInputWrapper edge_dst_value_input,
+                     EdgeValueInputWrapper edge_value_input,
+                     EdgeOp e_op,
+                     T init,
+                     bool do_expensive_check = false)
+{
+  detail::direct_transform_reduce_e_segment_launcher segment_launcher{handle.get_stream()};
+  return detail::transform_reduce_e_with_segment_launcher(handle,
+                                                          graph_view,
+                                                          edge_src_value_input,
+                                                          edge_dst_value_input,
+                                                          edge_value_input,
+                                                          e_op,
+                                                          init,
+                                                          segment_launcher,
+                                                          do_expensive_check);
 }
 
 /**

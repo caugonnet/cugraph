@@ -327,6 +327,70 @@ endfunction()
 ### test sources ##################################################################################
 ###################################################################################################
 
+if(BUILD_CUGRAPH_STF_EXPERIMENT)
+    find_path(CUGRAPH_STF_RAFT_INCLUDE
+              raft/core/handle.hpp
+              HINTS "${raft_DIR}/../../.."
+              PATH_SUFFIXES include
+              REQUIRED)
+    ConfigureTest(STF_TRANSFORM_REDUCE_E_EXPERIMENT
+                  experimental/stf/transform_reduce_e_experiment.cu)
+    target_include_directories(STF_TRANSFORM_REDUCE_E_EXPERIMENT
+                               PRIVATE "${CUGRAPH_STF_RAFT_INCLUDE}")
+    target_compile_options(STF_TRANSFORM_REDUCE_E_EXPERIMENT
+                           PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:-I${CUGRAPH_STF_RAFT_INCLUDE}>")
+    target_link_libraries(STF_TRANSFORM_REDUCE_E_EXPERIMENT
+                          PRIVATE raft::raft cudax::cudax CUDA::cuda_driver)
+    ConfigureTest(STF_SSSP_EXPERIMENT
+                  experimental/stf/sssp_experiment.cu)
+    target_include_directories(STF_SSSP_EXPERIMENT
+                               PRIVATE "${CUGRAPH_STF_RAFT_INCLUDE}")
+    target_compile_options(STF_SSSP_EXPERIMENT
+                           PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:-I${CUGRAPH_STF_RAFT_INCLUDE}>")
+    target_link_libraries(STF_SSSP_EXPERIMENT
+                          PRIVATE raft::raft cudax::cudax CUDA::cuda_driver)
+    ConfigureTest(STF_CONDITIONAL_KATZ_EXPERIMENT
+                  experimental/stf/conditional_katz_experiment.cu)
+    target_include_directories(STF_CONDITIONAL_KATZ_EXPERIMENT
+                               PRIVATE "${CUGRAPH_STF_RAFT_INCLUDE}")
+    target_compile_options(STF_CONDITIONAL_KATZ_EXPERIMENT
+                           PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:-I${CUGRAPH_STF_RAFT_INCLUDE}>")
+    target_link_libraries(STF_CONDITIONAL_KATZ_EXPERIMENT
+                          PRIVATE raft::raft cudax::cudax CUDA::cuda_driver)
+    ConfigureTest(STF_CONCURRENT_PAGERANK_EXPERIMENT
+                  experimental/stf/concurrent_pagerank_experiment.cu)
+    target_include_directories(STF_CONCURRENT_PAGERANK_EXPERIMENT
+                               PRIVATE "${CUGRAPH_STF_RAFT_INCLUDE}")
+    target_compile_options(STF_CONCURRENT_PAGERANK_EXPERIMENT
+                           PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:-I${CUGRAPH_STF_RAFT_INCLUDE}>")
+    target_link_libraries(STF_CONCURRENT_PAGERANK_EXPERIMENT
+                          PRIVATE raft::raft cudax::cudax CUDA::cuda_driver)
+    ConfigureTest(STF_COMPOSED_CENTRALITY_EXPERIMENT
+                  experimental/stf/composed_centrality_experiment.cu)
+    target_include_directories(STF_COMPOSED_CENTRALITY_EXPERIMENT
+                               PRIVATE "${CUGRAPH_STF_RAFT_INCLUDE}")
+    target_compile_options(STF_COMPOSED_CENTRALITY_EXPERIMENT
+                           PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:-I${CUGRAPH_STF_RAFT_INCLUDE}>")
+    target_link_libraries(STF_COMPOSED_CENTRALITY_EXPERIMENT
+                          PRIVATE raft::raft cudax::cudax CUDA::cuda_driver)
+    ConfigureTest(STF_NATIVE_PAGERANK_EXPERIMENT
+                  experimental/stf/native_pagerank_experiment.cu)
+    target_include_directories(STF_NATIVE_PAGERANK_EXPERIMENT
+                               PRIVATE "${CUGRAPH_STF_RAFT_INCLUDE}")
+    target_compile_options(STF_NATIVE_PAGERANK_EXPERIMENT
+                           PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:-I${CUGRAPH_STF_RAFT_INCLUDE}>")
+    target_link_libraries(STF_NATIVE_PAGERANK_EXPERIMENT
+                          PRIVATE raft::raft cudax::cudax CUDA::cuda_driver)
+    ConfigureTest(STF_OPTIMIZED_PAGERANK_EXPERIMENT
+                  experimental/stf/optimized_pagerank_stf_experiment.cu)
+    target_include_directories(STF_OPTIMIZED_PAGERANK_EXPERIMENT
+                               PRIVATE "${CUGRAPH_STF_RAFT_INCLUDE}")
+    target_compile_options(STF_OPTIMIZED_PAGERANK_EXPERIMENT
+                           PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:-I${CUGRAPH_STF_RAFT_INCLUDE}>")
+    target_link_libraries(STF_OPTIMIZED_PAGERANK_EXPERIMENT
+                          PRIVATE raft::raft cudax::cudax CUDA::cuda_driver)
+endif()
+
 ###################################################################################################
 # - graph generator tests -------------------------------------------------------------------------
 ConfigureTest(GRAPH_GENERATORS_TEST generators/generators_test.cpp)
