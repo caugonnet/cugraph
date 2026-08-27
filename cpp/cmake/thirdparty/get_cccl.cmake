@@ -18,7 +18,10 @@ function(find_and_configure_cccl)
       INSTALL_EXPORT_SET cugraph-exports
       ENABLE_UNSTABLE
       GIT_REPOSITORY https://github.com/caugonnet/cccl.git
-      GIT_TAG 46c1ec41a8cb8196e5ca2becddd5bd388286d66f)
+      # lab/cugraph-stf-sibling-fixes: NVIDIA/cccl#11041 (stream-affine
+      # executable graph cache) + NVIDIA/cccl#11036 (preserve nested read-only
+      # imports). Both are required for the composed centrality experiment.
+      GIT_TAG 5a2340eb476a5d7f73056018aa9adb3be106bb71)
   elseif(BUILD_CUGRAPH_STF_EXPERIMENT)
     rapids_cpm_cccl(
       BUILD_EXPORT_SET cugraph-exports
