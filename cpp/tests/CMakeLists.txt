@@ -389,6 +389,22 @@ if(BUILD_CUGRAPH_STF_EXPERIMENT)
                            PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:-I${CUGRAPH_STF_RAFT_INCLUDE}>")
     target_link_libraries(STF_OPTIMIZED_PAGERANK_EXPERIMENT
                           PRIVATE raft::raft cudax::cudax CUDA::cuda_driver)
+    ConfigureTest(STF_EIGENVECTOR_EXPERIMENT
+                  experimental/stf/eigenvector_stf_experiment.cu)
+    target_include_directories(STF_EIGENVECTOR_EXPERIMENT
+                               PRIVATE "${CUGRAPH_STF_RAFT_INCLUDE}")
+    target_compile_options(STF_EIGENVECTOR_EXPERIMENT
+                           PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:-I${CUGRAPH_STF_RAFT_INCLUDE}>")
+    target_link_libraries(STF_EIGENVECTOR_EXPERIMENT
+                          PRIVATE raft::raft cudax::cudax CUDA::cuda_driver)
+    ConfigureTest(STF_ECG_CONCURRENCY_EXPERIMENT
+                  experimental/stf/ecg_concurrency_experiment.cu)
+    target_include_directories(STF_ECG_CONCURRENCY_EXPERIMENT
+                               PRIVATE "${CUGRAPH_STF_RAFT_INCLUDE}")
+    target_compile_options(STF_ECG_CONCURRENCY_EXPERIMENT
+                           PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:-I${CUGRAPH_STF_RAFT_INCLUDE}>")
+    target_link_libraries(STF_ECG_CONCURRENCY_EXPERIMENT
+                          PRIVATE raft::raft cudax::cudax CUDA::cuda_driver)
 endif()
 
 ###################################################################################################
