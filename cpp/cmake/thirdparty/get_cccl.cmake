@@ -21,8 +21,9 @@ function(find_and_configure_cccl)
       # lab/cugraph-stf-sibling-fixes: NVIDIA/cccl#11041 (stream-affine
       # executable graph cache) + NVIDIA/cccl#11036 (preserve nested read-only
       # imports), required for the composed centrality experiment, plus the
-      # update_cond token-dependency fix required by the eigenvector token arm.
-      GIT_TAG d273d5d88df4401f2b9df2e89778b9c537cb9971)
+      # update_cond token-dependency fix (NVIDIA/cccl#11056) required by the
+      # eigenvector token arm.
+      GIT_TAG 1cd119df1f4371be0b6b00a1ac89a37bafcf2b5b)
   elseif(BUILD_CUGRAPH_STF_EXPERIMENT)
     rapids_cpm_cccl(
       BUILD_EXPORT_SET cugraph-exports
