@@ -46,12 +46,16 @@ constexpr int max_iterations{500};
 // Asynchrony-only STF spelling of cuGraph's eigenvector centrality (the
 // (A + I) power iteration in centrality/eigenvector_centrality_impl.cuh):
 // tasks over the production per_v_transform_reduce_incoming_e traversal, CUB
-// reductions with caller-owned workspaces, and raw kernels. Three arms:
+// reductions with caller-owned workspaces, and raw kernels. Four arms:
 //
 // - the production public API (per-call allocation, host-controlled loop);
 // - a host loop over the same preallocated kernels (isolates what
 //   preallocation alone buys);
-// - the STF while_graph_scope (adds device-side iteration and replay).
+// - the STF while_graph_scope over typed logical data (adds device-side
+//   iteration and replay);
+// - the same topology over data-less tokens with pointer-carrying closures,
+//   demonstrating the minimal STF integration surface when every buffer
+//   preexists on one device and never moves.
 
 struct eigenvector_state {
   eigenvector_state(std::size_t size, rmm::cuda_stream_view stream)
@@ -126,6 +130,22 @@ struct eigenvector_continue_op {
   }
 };
 
+// Token-arm condition: ordering comes from the token deps; the functor
+// carries the raw pointers itself. Variadic so it works whether
+// void_interface instances are passed through or skipped.
+struct token_continue_op {
+  stf_result_t const* difference{};
+  int* iteration{};
+  stf_result_t threshold{};
+
+  template <typename... Args>
+  __device__ bool operator()(Args...) const
+  {
+    ++(*iteration);
+    return (*difference >= threshold) && (*iteration < max_iterations);
+  }
+};
+
 struct source_value_op {
   template <typename Src, typename Dst, typename SrcValue, typename DstValue, typename EdgeValue>
   __device__ stf_result_t operator()(Src, Dst, SrcValue src_value, DstValue, EdgeValue) const
@@ -171,6 +191,7 @@ TEST(CudaStfEigenvectorExperiment, CapturedProductionTraversal)
   // never run concurrently.
   eigenvector_state host_state{vertices, handle.get_stream()};
   eigenvector_state stf_state{vertices, handle.get_stream()};
+  eigenvector_state token_state{vertices, handle.get_stream()};
   cugraph::edge_src_property_t<stf_vertex_t, stf_result_t> edge_src_centralities(handle,
                                                                                  graph_view);
 
@@ -337,6 +358,105 @@ TEST(CudaStfEigenvectorExperiment, CapturedProductionTraversal)
   }
   graph_scope.exec();
 
+  // Token-only spelling of the same seven-task topology: every dependency is
+  // a data-less token and every closure captures the raw pointers directly.
+  // This is the minimal STF integration surface when all buffers preexist on
+  // one device and never move.
+  stf::stackable_ctx token_context;
+  auto t_current    = token_context.token();
+  auto t_old        = token_context.token();
+  auto t_norm       = token_context.token();
+  auto t_difference = token_context.token();
+  auto t_iteration  = token_context.token();
+  stf::stackable_ctx::launchable_graph_scope token_scope{token_context};
+  t_current.push(stf::access_mode::rw);
+  t_old.push(stf::access_mode::rw);
+  t_norm.push(stf::access_mode::rw);
+  t_difference.push(stf::access_mode::rw);
+  t_iteration.push(stf::access_mode::rw);
+
+  token_context.task(t_current.write(), t_iteration.write()).set_symbol("initialize state")
+      ->*[vertices,
+          initial,
+          current   = token_state.current.data(),
+          iteration = token_state.iteration.data()](cudaStream_t task_stream, auto...) {
+            initialize_centralities_kernel<<<grid_size(vertices), block_size, 0, task_stream>>>(
+              current, vertices, initial);
+            initialize_iteration_kernel<<<1, 1, 0, task_stream>>>(iteration);
+          };
+
+  {
+    auto loop = token_context.while_graph_scope(1);
+    token_context.task(t_old.write(), t_current.read()).set_symbol("copy to old")
+        ->*
+      [vertices, old = token_state.old.data(), current = token_state.current.data()](
+        cudaStream_t task_stream, auto...) {
+        copy_values<<<grid_size(vertices), block_size, 0, task_stream>>>(old, current, vertices);
+      };
+    token_context.task(t_old.read(), t_current.write()).set_symbol("optimized incoming traversal")
+        ->*
+      [graph_view,
+       &edge_src_centralities,
+       old     = token_state.old.data(),
+       current = token_state.current.data()](cudaStream_t task_stream, auto...) {
+        raft::handle_t task_handle{rmm::cuda_stream_view{task_stream}};
+        cugraph::update_edge_src_property(
+          task_handle, graph_view, old, edge_src_centralities.mutable_view());
+        cugraph::per_v_transform_reduce_incoming_e(task_handle,
+                                                   graph_view,
+                                                   edge_src_centralities.view(),
+                                                   cugraph::edge_dst_dummy_property_t{}.view(),
+                                                   cugraph::edge_dummy_property_t{}.view(),
+                                                   source_value_op{},
+                                                   stf_result_t{0},
+                                                   cugraph::reduce_op::plus<stf_result_t>{},
+                                                   current);
+      };
+    token_context.task(t_current.rw(), t_old.read()).set_symbol("add identity term")
+        ->*[vertices, current = token_state.current.data(), old = token_state.old.data()](
+             cudaStream_t task_stream, auto...) {
+              add_values_kernel<<<grid_size(vertices), block_size, 0, task_stream>>>(
+                current, old, vertices);
+            };
+    token_context.task(t_current.read(), t_norm.write()).set_symbol("norm (cub)")
+        ->*[temp       = norm_temp.data(),
+            temp_bytes = norm_temp_bytes,
+            vertices,
+            current = token_state.current.data(),
+            norm    = token_state.norm_sq.data()](cudaStream_t task_stream, auto...) {
+              auto bytes = temp_bytes;
+              RAFT_CUDA_TRY(cub::DeviceReduce::Sum(
+                temp, bytes, make_reduce_input(square_op{current}), norm, vertices, task_stream));
+            };
+    token_context.task(t_current.rw(), t_norm.read()).set_symbol("normalize")
+        ->*[vertices, current = token_state.current.data(), norm = token_state.norm_sq.data()](
+             cudaStream_t task_stream, auto...) {
+              normalize_by_l2_kernel<<<grid_size(vertices), block_size, 0, task_stream>>>(
+                current, norm, vertices);
+            };
+    token_context.task(t_current.read(), t_old.read(), t_difference.write())
+        .set_symbol("difference (cub)")
+        ->*[temp       = difference_temp.data(),
+            temp_bytes = difference_temp_bytes,
+            vertices,
+            current    = token_state.current.data(),
+            old        = token_state.old.data(),
+            difference = token_state.difference_sum.data()](cudaStream_t task_stream, auto...) {
+              auto bytes = temp_bytes;
+              RAFT_CUDA_TRY(
+                cub::DeviceReduce::Sum(temp,
+                                       bytes,
+                                       make_reduce_input(absolute_difference_op{current, old}),
+                                       difference,
+                                       vertices,
+                                       task_stream));
+            };
+    loop.update_cond(t_difference.read(), t_iteration.rw())
+        ->*token_continue_op{
+             token_state.difference_sum.data(), token_state.iteration.data(), threshold};
+  }
+  token_scope.exec();
+
   rmm::device_uvector<stf_result_t> reference(vertices, handle.get_stream());
   auto run_reference = [&] {
     reference = cugraph::eigenvector_centrality<stf_vertex_t, stf_edge_t, stf_result_t, false>(
@@ -353,9 +473,10 @@ TEST(CudaStfEigenvectorExperiment, CapturedProductionTraversal)
   run_reference();
   run_host_loop(stream);
   graph_scope.launch();
+  token_scope.launch();
   RAFT_CUDA_TRY(cudaDeviceSynchronize());
 
-  std::array<std::vector<double>, 3> samples;
+  std::array<std::vector<double>, 4> samples;
   auto const repetitions = experiment_repetitions();
   for (auto& values : samples) {
     values.reserve(repetitions);
@@ -367,33 +488,41 @@ TEST(CudaStfEigenvectorExperiment, CapturedProductionTraversal)
         samples[arm].push_back(wall_time_ms(run_reference));
       } else if (arm == 1) {
         samples[arm].push_back(wall_time_ms([&] { run_host_loop(stream); }));
-      } else {
+      } else if (arm == 2) {
         samples[arm].push_back(wall_time_ms([&] { graph_scope.launch(); }));
+      } else {
+        samples[arm].push_back(wall_time_ms([&] { token_scope.launch(); }));
       }
     }
   }
 
-  auto const host_mismatches = mismatch_count(handle, reference, host_state.current);
-  auto const stf_mismatches  = mismatch_count(handle, reference, stf_state.current);
+  auto const host_mismatches  = mismatch_count(handle, reference, host_state.current);
+  auto const stf_mismatches   = mismatch_count(handle, reference, stf_state.current);
+  auto const token_mismatches = mismatch_count(handle, reference, token_state.current);
   EXPECT_EQ(host_mismatches, std::size_t{0});
   EXPECT_EQ(stf_mismatches, std::size_t{0});
-  std::array<int, 2> iterations{};
+  EXPECT_EQ(token_mismatches, std::size_t{0});
+  std::array<int, 3> iterations{};
   RAFT_CUDA_TRY(
     cudaMemcpy(&iterations[0], host_state.iteration.data(), sizeof(int), cudaMemcpyDeviceToHost));
   RAFT_CUDA_TRY(
     cudaMemcpy(&iterations[1], stf_state.iteration.data(), sizeof(int), cudaMemcpyDeviceToHost));
+  RAFT_CUDA_TRY(
+    cudaMemcpy(&iterations[2], token_state.iteration.data(), sizeof(int), cudaMemcpyDeviceToHost));
   EXPECT_EQ(iterations[0], iterations[1]);
+  EXPECT_EQ(iterations[0], iterations[2]);
   EXPECT_GT(iterations[1], 0);
 
-  constexpr std::array<std::string_view, 3> names{
-    "production_cugraph", "preallocated_host_loop", "captured_cuda_stf"};
+  constexpr std::array<std::string_view, 4> names{
+    "production_cugraph", "preallocated_host_loop", "captured_cuda_stf", "token_cuda_stf"};
   for (std::size_t arm = 0; arm < names.size(); ++arm) {
     auto result = summarize(std::move(samples[arm]));
     std::cout << std::fixed << std::setprecision(3) << "CUGRAPH_STF_RESULT"
               << " algorithm=eigenvector_centrality"
               << " arm=" << names[arm] << " median_ms=" << result.median_ms
               << " min_ms=" << result.min_ms << " iterations=" << iterations[1]
-              << " host_mismatches=" << host_mismatches << " stf_mismatches=" << stf_mismatches
+              << " token_iterations=" << iterations[2] << " host_mismatches=" << host_mismatches
+              << " stf_mismatches=" << stf_mismatches << " token_mismatches=" << token_mismatches
               << " vertices=" << vertices << " edges=" << edges << '\n';
   }
 
